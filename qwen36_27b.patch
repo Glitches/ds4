@@ -1,0 +1,94 @@
+diff --git a/ds4.h b/ds4.h
+index 0000000..0000000 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -1,5 +1,10 @@
+ // ds4.h - Main header file
+ 
++// ============================================================================
++// Qwen 3.6 27B Model Support
++// ============================================================================
++
++#define DS4_FILE_MAGIC_QWEN36_27B 0xQW3627B0
+ 
+ // Existing code...
+ 
+@@ -100,6 +105,7 @@ enum ds4_model_type {
+     DS4_MODEL_MISTRAL,
+     DS4_MODEL_LLAMA,
+     DS4_MODEL_GPT,
++    DS4_MODEL_QWEN36_27B,
+     DS4_MODEL_COUNT
+ };
+ 
+@@ -500,6 +506,10 @@ struct ds4_model_config {
+     // Existing model configs...
+ };
+ 
++// Qwen 3.6 27B model configuration forward declaration
++extern const struct ds4_model_config qwen36_27b_config;
++
+ // Existing code...
+
+diff --git a/ds4.c b/ds4.c
+index 0000000..0000000 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -200,6 +200,10 @@ const struct ds4_model_config *ds4_get_model_config(enum ds4_model_type type)
+     case DS4_MODEL_GPT:
+         return &gpt_config;
+         break;
++    case DS4_MODEL_QWEN36_27B:
++        return &qwen36_27b_config;
++        break;
+     default:
+         return NULL;
+         break;
+@@ -300,6 +304,30 @@ const struct ds4_model_config mistral_config = {
+     // Existing configs...
+ };
+ 
++// Qwen 3.6 27B Model Configuration
++static const struct ds4_model_config qwen36_27b_config = {
++    .num_layers = 80,
++    .hidden_size = 8192,
++    .num_attention_heads = 64,
++    .num_key_value_heads = 8,
++    .intermediate_size = 22016,
++    .max_seq_len = 32768,
++    .vocab_size = 152064,
++    .rope_dim = 128,
++    .rope_base = 500000.0f,
++    .norm_type = DS4_NORM_RMS,
++    .mlp_activation = DS4_ACTIVATION_SWIGLU,
++    .attention_type = DS4_ATTENTION_GQA,
++    .model_name = "qwen36-27b",
++    .file_id = DS4_FILE_MAGIC_QWEN36_27B,
++    .quantization_version = 1,
++};
++
+ // Existing code...
+
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 0000000..0000000 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -1000,6 +1000,18 @@ static void configure_metal_for_model(struct ds4_metal_context *ctx, const str
+     }
+     // Add other model configurations...
+ 
++    // Qwen 3.6 27B Metal configuration
++    if (model_config->file_id == DS4_FILE_MAGIC_QWEN36_27B) {
++        metal_config.threads_per_threadgroup = 512;
++        metal_config.max_threads_per_threadgroup = 1024;
++        metal_config.threadgroup_size = MTLSizeMake(32, 16, 1);
++        metal_config.use_flash_attention = true;
++        metal_config.use_swiglu = true;
++        metal_config.use_rmsnorm = true;
++        metal_config.use_rope = true;
++        metal_config.rope_dim = 128;
++    }
++
+     // Set the metal configuration
+     ctx->metal_config = metal_config;
+ }
