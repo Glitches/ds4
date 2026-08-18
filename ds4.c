@@ -44239,6 +44239,66 @@ static void qwen_graph_free_tensors(ds4_qwen_gpu_graph *g) {
     g->ready = false;
 }
 
+/* Allocate the per-session Qwen graph state for the Metal backend.
+ *
+ * cache_cap is the KV cache row capacity per layer (= ctx_size, one row per
+ * token, no MLA compression). Scratch tensors are sized for single-token
+ * decode (n_tok=1). Returns true on success and sets g->ready. */
+static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t cache_cap) {
+    if (!g || cache_cap == 0) return false;
+    memset(g, 0, sizeof(*g));
+    const uint32_t n_tok = 1u;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t n_kv_heads = DS4_N_HEAD_KV;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_ff = DS4_N_FF_DENSE;
+    const uint32_t q_dim = n_head * head_dim;
+    const uint32_t kv_dim = n_kv_heads * head_dim;
+    const uint64_t f32 = sizeof(float);
+
+    g->cache_cap = cache_cap;
+    g->cache_len = 0;
+
+    g->cur        = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->nxt        = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->norm       = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->q          = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_dim * f32);
+    g->k          = ds4_gpu_tensor_alloc((uint64_t)n_tok * kv_dim * f32);
+    g->v          = ds4_gpu_tensor_alloc((uint64_t)n_tok * kv_dim * f32);
+    g->heads      = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_dim * f32);
+    g->attn_out   = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->after_attn = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->gate       = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_ff * f32);
+    g->up         = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_ff * f32);
+    g->mid        = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_ff * f32);
+    g->ffn_out    = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+
+    const uint64_t cache_bytes = (uint64_t)cache_cap * kv_dim * f32;
+    g->key_cache = calloc(DS4_N_LAYER, sizeof(ds4_gpu_tensor *));
+    g->value_cache = calloc(DS4_N_LAYER, sizeof(ds4_gpu_tensor *));
+    bool ok = g->key_cache && g->value_cache;
+    for (uint32_t i = 0; ok && i < DS4_N_LAYER; i++) {
+        g->key_cache[i] = ds4_gpu_tensor_alloc(cache_bytes);
+        g->value_cache[i] = ds4_gpu_tensor_alloc(cache_bytes);
+        if (!g->key_cache[i] || !g->value_cache[i]) ok = false;
+    }
+
+    ok = ok && g->cur && g->nxt && g->norm && g->q && g->k && g->v &&
+         g->heads && g->attn_out && g->after_attn && g->gate && g->up &&
+         g->mid && g->ffn_out;
+    if (!ok) {
+        qwen_graph_free_tensors(g);
+        return false;
+    }
+    g->ready = true;
+    return true;
+}
+
+static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
+    qwen_graph_free_tensors(g);
+}
+
 /* Decode a single token through the Qwen standard-transformer graph on Metal.
  *
  * n_tok is 1 here (single-token decode); the path follows the same tensor
@@ -49500,6 +49560,8 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
+    ds4_qwen_gpu_graph qwen_graph;
+    bool qwen_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
     int glm_mtp_draft;
@@ -58852,6 +58914,24 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN36_27B) {
+        /* Qwen 3.6 27B is a standard transformer (GQA + SwiGLU + RMSNorm + RoPE).
+         * It has no MLA compression, so the per-layer KV cache row capacity is
+         * just the context length. Only single-token decode is wired by the
+         * qwen_graph_forward_token path; prefill reuses it token-by-token. */
+        const uint32_t cache_cap = (uint32_t)ctx_size;
+        if (!qwen_graph_alloc(&s->qwen_graph, cache_cap)) {
+            fprintf(stderr, "ds4: Qwen Metal graph alloc failed (cap %u)\n",
+                    cache_cap);
+            free(s);
+            return 1;
+        }
+        s->prefill_cap = cache_cap;
+        ds4_gpu_enable_q8_dequant_gemm();
+        s->qwen_graph_ready = true;
+        *out = s;
+        return 0;
+    }
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
@@ -59041,6 +59121,9 @@ void ds4_session_free(ds4_session *s) {
     else {
         if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
+        } else if (ds4_session_is_qwen(s)) {
+            qwen_graph_free(&s->qwen_graph);
+            s->qwen_graph_ready = false;
         } else {
             metal_graph_free(&s->graph);
         }
@@ -60133,6 +60216,52 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_qwen(s)) {
+        /* Qwen prefill: single-token decode path has no batched prefill kernel
+         * yet, so replay the prompt token-by-token through ds4_session_eval
+         * (which already handles pos = checkpoint.len, KV store, logits). When
+         * the prompt extends a valid checkpoint, only the new tail is replayed;
+         * otherwise the KV caches must be reset and the full prompt replayed. */
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            s->mtp_draft_valid = false;
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint_valid = true;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                const int rc = ds4_session_eval(s, prompt->v[i], err, errlen);
+                if (rc != 0) return rc;
+                if (s->progress && ((i - s->checkpoint.len + 1) % 8 == 0 ||
+                                    i + 1 == prompt->len)) {
+                    s->progress(s->progress_ud, "prefill",
+                                i + 1, prompt->len);
+                }
+            }
+            return 0;
+        }
+        /* Checkpoint diverged: drop KV state and replay from scratch. */
+        s->checkpoint.len = 0;
+        s->checkpoint_valid = false;
+        s->qwen_graph.cache_len = 0;
+        for (int i = 0; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            const int rc = ds4_session_eval(s, prompt->v[i], err, errlen);
+            if (rc != 0) return rc;
+            if (s->progress && ((i + 1) % 8 == 0 || i + 1 == prompt->len)) {
+                s->progress(s->progress_ud, "prefill", i + 1, prompt->len);
+            }
+        }
+        return 0;
+    }
+#endif
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -61896,6 +62025,40 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    /* Qwen 3.6 27B standard-transformer Metal path: single-token decode only.
+     * Handled here before the GLM/DeepSeek/TP machinery so that family's
+     * MLA/indexer-specific graph state is never touched for a Qwen session. */
+    if (ds4_session_is_qwen(s)) {
+        if (!s->qwen_graph_ready) {
+            if (errlen) snprintf(err, errlen, "%s Qwen graph is not initialized",
+                                 ds4_backend_name(s->engine->backend));
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= s->qwen_graph.cache_cap) {
+            if (errlen) snprintf(err, errlen,
+                                 "Qwen Metal context reached (%u)",
+                                 s->qwen_graph.cache_cap);
+            return 1;
+        }
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (!qwen_graph_forward_token(&s->qwen_graph,
+                                      &s->engine->model,
+                                      &s->engine->weights,
+                                      token,
+                                      pos,
+                                      s->logits)) {
+            if (errlen) snprintf(err, errlen, "%s Qwen decode failed",
+                                 ds4_backend_name(s->engine->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->qwen_graph.cache_len = pos + 1u;
+        return 0;
+    }
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -66910,6 +67073,9 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+    if (ds4_session_is_qwen(s) && s->qwen_graph_ready) {
+        s->qwen_graph.cache_len = 0;
+    }
 #endif
 }
 

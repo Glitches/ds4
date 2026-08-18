@@ -102,19 +102,33 @@ magic, enables flash attention, SwiGLU, RMSNorm, RoPE and the model's rope dim.
 - `ds4_gpu_swiglu_tensor`      - SwiGLU activation of the FFN gate/up pair
 - `ds4_gpu_add_tensor`         - residual connections
 
+### Session integration
+
+`ds4_session` now owns the Qwen graph state end-to-end:
+
+- `ds4_session_create()` allocates `s->qwen_graph` (scratch tensors + one
+  `[cache_cap * n_kv_heads * head_dim]` KV cache per layer, `cache_cap = ctx_size`)
+  and sets `s->qwen_graph_ready = true` when `DS4_MODEL_FAMILY_QWEN36_27B`.
+- `ds4_session_eval()` runs `qwen_graph_forward_token()` (single-token decode)
+  when `ds4_session_is_qwen(s)`, updating `pos = checkpoint.len`, the KV cache,
+  and `s->logits`, before the GLM/DeepSeek/TP machinery is reached.
+- `ds4_session_sync_internal()` (prefill) replays the prompt token-by-token
+  through `ds4_session_eval()`; when the prompt extends a valid checkpoint only
+  the new tail is replayed, otherwise KV state is reset and the prompt is
+  replayed in full.
+- `ds4_session_invalidate()` resets `qwen_graph.cache_len` on rewind.
+- `ds4_session_free()` calls `qwen_graph_free()`.
+
 ### Limitations of this phase
 
 - **Metal-only.** The CUDA backend is unchanged; GQA on CUDA is out of scope.
-- **Single-token decode.** `qwen_graph_forward_token` implements the decode
-  path (`n_tok=1`). Prefill / batched decode are not yet wired.
+- **Single-token decode / prefill-by-replay.** There is no batched prefill
+  kernel yet; prefill runs the decode path token-by-token. Correct, but not
+  optimal for long prompts.
 - **Not validated end-to-end here.** The sandbox is Linux without the Metal
   framework, so `ds4_metal.m` / `metal/qwen_gqa.metal` could not be compiled
   or run here. `ds4.c` / `ds4_gpu.h` were syntax-checked (see Verification).
   Build + smoke test against a real Qwen 3.6 27B GGUF must happen on macOS.
-- **Graph state lifecycle.** `ds4_qwen_gpu_graph` is defined and freed but not
-  yet allocated/owned by `ds4_session`; the session integration (allocating
-  scratch + per-layer KV caches, calling `qwen_graph_forward_token` from the
-  eval path when `ds4_session_is_qwen(s)`) is the next step.
 
 ## Applying
 
