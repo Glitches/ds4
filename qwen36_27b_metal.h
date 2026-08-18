@@ -14,17 +14,13 @@
 
 #include "ds4.h"
 
-/* Qwen 3.6 27B uses standard transformer blocks:
- *   - MatMul            (dense.metal)
- *   - RMSNorm           (norm.metal)
- *   - SwiGLU            (glu.metal)
- *   - RoPE              (rope.metal)
- *   - Flash/GQA attn    (flash_attn.metal)
- *   - Softmax           (softmax.metal)
- *
- * No new Metal kernels are required; the existing ones already cover the
- * operations this model needs.
- */
+/* Qwen 3.6 27B uses a standard transformer block (dense Q/K/V/O + SwiGLU FFN
+ * + RMSNorm + RoPE, GQA with n_kv_heads=8). The MatMul / RMSNorm / SwiGLU /
+ * RoPE stages reuse the existing generic Metal kernels, but grouped-query
+ * attention is NOT covered by kernel_glm_attention_full (pure MHA) or the
+ * DeepSeek MLA dual-cache attention family. The dedicated GQA kernels live in
+ * metal/qwen_gqa.metal (kernel_qwen_store_kv, kernel_qwen_attention_gqa) and
+ * are resolved by configure_metal_for_model(); see QWEN36_27B_PATCH.md. */
 
 /* Tuned Metal dispatch parameters for Qwen 3.6 27B. */
 #define QWEN36_27B_METAL_THREADS_PER_THREADGROUP      512

@@ -484,8 +484,9 @@ enum {
 };
 
 typedef enum {
-    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
-    DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    DS4_MODEL_FAMILY_DEEPSEEK4   = 0,
+    DS4_MODEL_FAMILY_GLM_DSA     = 1,
+    DS4_MODEL_FAMILY_QWEN36_27B  = 2,
 } ds4_model_family;
 
 typedef enum {
@@ -4115,6 +4116,12 @@ typedef struct {
     ds4_tensor *attn_v_b;
     ds4_tensor *attn_sinks;
     ds4_tensor *attn_output;
+    /* Standard-transformer (non-MLA) dense attention weights used by the
+     * Qwen 3.6 27B path. NULL for DeepSeek/GLM families. */
+    ds4_tensor *qwen_attn_q;
+    ds4_tensor *qwen_attn_k;
+    ds4_tensor *qwen_attn_v;
+    ds4_tensor *qwen_attn_o;
     ds4_tensor *attn_output_a;
     ds4_tensor *attn_output_b;
     ds4_tensor *attn_compressor_ape;
@@ -5892,9 +5899,29 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
     }
 }
 
+/* Qwen 3.6 27B is a standard transformer: dense Q/K/V/O projections, dense
+ * SwiGLU FFN (gate/up/down), RMSNorm pre/post attention, RoPE on Q and K. No
+ * low-rank Q, no MLA dual-cache, no indexer. The fields bound here are the only
+ * ones the qwen_graph_forward_token path consumes. */
+static void weights_bind_qwen_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm     = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->qwen_attn_q   = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->qwen_attn_k   = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->qwen_attn_v   = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->qwen_attn_o   = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->ffn_norm      = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate      = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+    l->ffn_up        = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+    l->ffn_down      = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN36_27B) {
+        weights_bind_qwen_layer(l, m, il);
         return;
     }
 
@@ -44162,6 +44189,202 @@ static bool glm_graph_mtp_step(
     return true;
 }
 
+/* Per-session state for the Qwen standard-transformer Metal path. The KV caches
+ * are per-layer [cache_cap * n_kv_heads * head_dim]; everything else is scratch
+ * tensor reused across layers within one decode step. */
+typedef struct {
+    ds4_gpu_tensor *cur;            /* hidden state, [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *nxt;            /* next hidden state, swapped with cur */
+    ds4_gpu_tensor *norm;           /* [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *q;              /* [n_tok, n_head*head_dim] f32 */
+    ds4_gpu_tensor *k;              /* [n_tok, n_kv_heads*head_dim] f32 */
+    ds4_gpu_tensor *v;              /* [n_tok, n_kv_heads*head_dim] f32 */
+    ds4_gpu_tensor *heads;          /* attention output [n_tok, n_head*head_dim] */
+    ds4_gpu_tensor *attn_out;      /* [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *after_attn;     /* residual [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *gate;           /* [n_tok, n_ff_dense] f32 */
+    ds4_gpu_tensor *up;             /* [n_tok, n_ff_dense] f32 */
+    ds4_gpu_tensor *mid;            /* swiglu(gate,up) [n_tok, n_ff_dense] */
+    ds4_gpu_tensor *ffn_out;        /* [n_tok, n_embd] f32 */
+    ds4_gpu_tensor **key_cache;     /* [n_layer] */
+    ds4_gpu_tensor **value_cache;   /* [n_layer] */
+    uint32_t cache_cap;
+    uint32_t cache_len;
+    bool ready;
+} ds4_qwen_gpu_graph;
+
+static void qwen_graph_free_tensors(ds4_qwen_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor_free(g->cur); g->cur = NULL;
+    ds4_gpu_tensor_free(g->nxt); g->nxt = NULL;
+    ds4_gpu_tensor_free(g->norm); g->norm = NULL;
+    ds4_gpu_tensor_free(g->q); g->q = NULL;
+    ds4_gpu_tensor_free(g->k); g->k = NULL;
+    ds4_gpu_tensor_free(g->v); g->v = NULL;
+    ds4_gpu_tensor_free(g->heads); g->heads = NULL;
+    ds4_gpu_tensor_free(g->attn_out); g->attn_out = NULL;
+    ds4_gpu_tensor_free(g->after_attn); g->after_attn = NULL;
+    ds4_gpu_tensor_free(g->gate); g->gate = NULL;
+    ds4_gpu_tensor_free(g->up); g->up = NULL;
+    ds4_gpu_tensor_free(g->mid); g->mid = NULL;
+    ds4_gpu_tensor_free(g->ffn_out); g->ffn_out = NULL;
+    if (g->key_cache) {
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) ds4_gpu_tensor_free(g->key_cache[i]);
+        free(g->key_cache); g->key_cache = NULL;
+    }
+    if (g->value_cache) {
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) ds4_gpu_tensor_free(g->value_cache[i]);
+        free(g->value_cache); g->value_cache = NULL;
+    }
+    g->ready = false;
+}
+
+/* Decode a single token through the Qwen standard-transformer graph on Metal.
+ *
+ * n_tok is 1 here (single-token decode); the path follows the same tensor
+ * conventions as glm_graph_forward_token but routes attention through the GQA
+ * kernels (kernel_qwen_store_kv / kernel_qwen_attention_gqa) instead of the
+ * DeepSeek MLA / GLM indexer family. RoPE is applied to Q and K in place via
+ * ds4_gpu_rope_tail_tensor over the [n_head/n_kv_heads, head_dim] layout.
+ *
+ * Returns true and writes logits_out (n_vocab floats) on success. The Metal
+ * backend is the only target; this function is compiled out under DS4_NO_GPU.
+ */
+static bool qwen_graph_forward_token(
+        ds4_qwen_gpu_graph *g,
+        const ds4_model    *model,
+        const ds4_weights *weights,
+        int                 token,
+        uint32_t            pos,
+        float              *logits_out) {
+    if (!g || !g->ready || !model || !weights || !logits_out) return false;
+    const uint32_t n_tok = 1u;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t n_kv_heads = DS4_N_HEAD_KV;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_rot = DS4_N_ROT;
+    const uint32_t n_ff = DS4_N_FF_DENSE;
+    const float eps = DS4_RMS_EPS;
+    const float freq_base = DS4_ROPE_FREQ_BASE;
+    const float freq_scale = DS4_ROPE_SCALE_FACTOR;
+    const float beta_fast = DS4_ROPE_YARN_BETA_FAST;
+    const float beta_slow = DS4_ROPE_YARN_BETA_SLOW;
+    const uint32_t n_ctx_orig = (uint32_t)DS4_ROPE_ORIG_CTX;
+    const uint32_t q_dim = n_head * head_dim;
+    const uint32_t kv_dim = n_kv_heads * head_dim;
+
+    /* Embedding lookup -> cur ([1, n_embd] f32). */
+    int32_t tok = token;
+    ds4_gpu_tensor *toks = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    if (!toks) return false;
+    bool ok = ds4_gpu_tensor_write(toks, 0, &tok, sizeof(int32_t)) != 0;
+    if (ok) {
+        ok = ds4_gpu_embed_tokens_quant_tensor(
+                g->cur, toks, model->map, model->size,
+                weights->token_embd->abs_offset, weights->token_embd->type,
+                DS4_N_VOCAB, n_tok, n_embd) != 0;
+    }
+    ds4_gpu_tensor_free(toks);
+    if (!ok) return false;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        if (!l->qwen_attn_q || !l->qwen_attn_k || !l->qwen_attn_v ||
+            !l->qwen_attn_o || !l->attn_norm || !l->ffn_norm ||
+            !l->ffn_gate || !l->ffn_up || !l->ffn_down) {
+            return false;
+        }
+
+        /* Pre-attention RMSNorm. */
+        ok = ds4_gpu_rms_norm_weight_tensor(
+                g->norm, g->cur, model->map, model->size,
+                l->attn_norm->abs_offset, n_embd, eps) != 0;
+
+        /* Q/K/V projections (dense, q8_0). */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->q, model->map, model->size, l->qwen_attn_q->abs_offset,
+                n_embd, q_dim, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->k, model->map, model->size, l->qwen_attn_k->abs_offset,
+                n_embd, kv_dim, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->v, model->map, model->size, l->qwen_attn_v->abs_offset,
+                n_embd, kv_dim, g->norm, n_tok) != 0;
+
+        /* RoPE on Q ([n_head, head_dim]) and K ([n_kv_heads, head_dim]). */
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+                g->q, n_tok, n_head, head_dim, n_rot, pos, n_ctx_orig,
+                false, freq_base, freq_scale, 0.0f, 1.0f,
+                beta_fast, beta_slow) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+                g->k, n_tok, n_kv_heads, head_dim, n_rot, pos, n_ctx_orig,
+                false, freq_base, freq_scale, 0.0f, 1.0f,
+                beta_fast, beta_slow) != 0;
+
+        /* Store K/V into the per-layer GQA cache. */
+        if (ok) ok = ds4_gpu_qwen_store_kv_tensor(
+                g->key_cache[il], g->value_cache[il], g->k, g->v,
+                pos, n_tok, g->cache_cap, n_kv_heads, head_dim, false) != 0;
+
+        /* Grouped-query attention (causal, single query token). */
+        const uint32_t cache_len = pos + n_tok;
+        if (ok) ok = ds4_gpu_qwen_attention_gqa_tensor(
+                g->heads, g->q, g->key_cache[il], g->value_cache[il],
+                pos, n_tok, cache_len, g->cache_cap,
+                n_head, n_kv_heads, head_dim, false) != 0;
+
+        /* Output projection + residual. */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->attn_out, model->map, model->size, l->qwen_attn_o->abs_offset,
+                q_dim, n_embd, g->heads, n_tok) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(
+                g->after_attn, g->cur, g->attn_out,
+                n_tok * n_embd) != 0;
+
+        /* Pre-FFN RMSNorm. */
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(
+                g->norm, g->after_attn, model->map, model->size,
+                l->ffn_norm->abs_offset, n_embd, eps) != 0;
+
+        /* SwiGLU FFN: gate, up, swiglu, down. */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->gate, model->map, model->size, l->ffn_gate->abs_offset,
+                n_embd, n_ff, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->up, model->map, model->size, l->ffn_up->abs_offset,
+                n_embd, n_ff, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_swiglu_tensor(
+                g->mid, g->gate, g->up, n_tok * n_ff, 0.0f, 1.0f) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->ffn_out, model->map, model->size, l->ffn_down->abs_offset,
+                n_ff, n_embd, g->mid, n_tok) != 0;
+
+        /* Residual -> nxt, then swap cur/nxt. */
+        if (ok) ok = ds4_gpu_add_tensor(
+                g->nxt, g->after_attn, g->ffn_out,
+                n_tok * n_embd) != 0;
+        if (!ok) return false;
+
+        ds4_gpu_tensor *tmp = g->cur;
+        g->cur = g->nxt;
+        g->nxt = tmp;
+    }
+
+    /* Final norm + output projection -> logits. */
+    ok = ds4_gpu_rms_norm_weight_tensor(
+            g->norm, g->cur, model->map, model->size,
+            weights->output_norm->abs_offset, n_embd, eps) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+            g->attn_out /* reuse as logits scratch */, model->map, model->size,
+            weights->output->abs_offset, n_embd, DS4_N_VOCAB,
+            g->norm, n_tok) != 0;
+    if (ok) ok = ds4_gpu_tensor_read(
+            g->attn_out, 0, logits_out,
+            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    return ok;
+}
+
 static bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -50097,6 +50320,10 @@ static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 
 static bool ds4_session_is_glm(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+static bool ds4_session_is_qwen(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN36_27B;
 }
 
 #ifndef DS4_NO_GPU

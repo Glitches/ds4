@@ -210,6 +210,8 @@ static id<MTLComputePipelineState> g_glm_build_kv_cache_pipeline;
 static id<MTLComputePipelineState> g_glm_build_kv_cache_decode_group4_pipeline;
 static id<MTLComputePipelineState> g_glm_build_kv_cache_flash_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_full_pipeline;
+static id<MTLComputePipelineState> g_qwen_store_kv_pipeline;
+static id<MTLComputePipelineState> g_qwen_attention_gqa_pipeline;
 static id<MTLComputePipelineState> g_glm_fill_selected_range_pipeline;
 static id<MTLComputePipelineState> g_glm_fill_selected_range_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_rope_tail_pipeline;
@@ -8461,6 +8463,10 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_build_kv_cache_flash");
         g_glm_attention_full_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_full");
+        g_qwen_store_kv_pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen_store_kv");
+        g_qwen_attention_gqa_pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen_attention_gqa");
         g_glm_fill_selected_range_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_fill_selected_range");
         g_glm_fill_selected_range_batch_pipeline =
@@ -10327,6 +10333,8 @@ void ds4_gpu_cleanup(void) {
         g_glm_build_kv_cache_decode_group4_pipeline = nil;
         g_glm_build_kv_cache_flash_pipeline = nil;
         g_glm_attention_full_pipeline = nil;
+        g_qwen_store_kv_pipeline = nil;
+        g_qwen_attention_gqa_pipeline = nil;
         g_glm_fill_selected_range_pipeline = nil;
         g_glm_fill_selected_range_batch_pipeline = nil;
         g_glm_indexer_rope_tail_pipeline = nil;
@@ -43258,13 +43266,173 @@ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
     (void)enabled;
 }
 
-/* --------------------------------------------------------------------------
- * Model-specific Metal configuration registry.
+/* -------------------------------------------------------------------------- * Qwen standard-transformer GQA tensor ops.
+ *
+ * Bindings for the metal/qwen_gqa.metal kernels. Unlike the GLM/DeepSeek MLA
+ * path, these keep a KV cache with n_kv_heads rows per position and map each
+ * query head onto its owning KV head (kv_head = head * n_kv_heads / n_head).
+ * RoPE on K is expected to have been applied upstream via
+ * ds4_gpu_rope_tail_tensor over the [n_kv_heads, head_dim] layout.
+ * -------------------------------------------------------------------------- */
+int ds4_gpu_qwen_store_kv_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *k_src,
+        const ds4_gpu_tensor *v_src,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        bool                  cache_f16) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!key_cache || !value_cache || !k_src || !v_src ||
+        n_tokens == 0 || cache_cap == 0 || n_kv_heads == 0 || head_dim == 0 ||
+        (head_dim & 3u) != 0 ||
+        pos0 > cache_cap || n_tokens > cache_cap - pos0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint32_t elem_bytes = cache_f16 ? (uint32_t)sizeof(uint16_t)
+                                              : (uint32_t)sizeof(float);
+        const uint64_t kv_row = (uint64_t)n_kv_heads * head_dim;
+        const uint64_t src_bytes = (uint64_t)n_tokens * kv_row * elem_bytes;
+        const uint64_t cache_bytes = (uint64_t)cache_cap * kv_row * elem_bytes;
+        if (ds4_gpu_tensor_bytes(key_cache) < cache_bytes ||
+            ds4_gpu_tensor_bytes(value_cache) < cache_bytes ||
+            ds4_gpu_tensor_bytes(k_src) < src_bytes ||
+            ds4_gpu_tensor_bytes(v_src) < src_bytes) {
+            fprintf(stderr, "ds4: Metal Qwen store_kv undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_hot_pipeline(g_qwen_store_kv_pipeline, "kernel_qwen_store_kv");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        struct {
+            uint32_t pos0, n_tokens, cache_cap, n_kv_heads;
+            uint32_t head_dim, cache_f16, pad0, pad1;
+        } args = {
+            pos0, n_tokens, cache_cap, n_kv_heads,
+            head_dim, cache_f16 ? 1u : 0u, 0u, 0u,
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k_src)
+                offset:ds4_gpu_tensor_offset(k_src) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(v_src)
+                offset:ds4_gpu_tensor_offset(v_src) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(key_cache)
+                offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(value_cache)
+                offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
+        /* Grid: (n_tokens, n_kv_heads, 1); threads handle the head_dim tile. */
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_kv_heads, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen store_kv")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen_attention_gqa_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        bool                  cache_f16) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads || !q || !key_cache || !value_cache ||
+        n_tokens == 0 || cache_len == 0 || cache_cap == 0 ||
+        n_head == 0 || n_kv_heads == 0 || head_dim == 0 ||
+        n_head % n_kv_heads != 0 ||
+        (head_dim & 3u) != 0 ||
+        cache_len > cache_cap ||
+        pos0 > cache_len || n_tokens > cache_len - pos0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint32_t elem_bytes = cache_f16 ? (uint32_t)sizeof(uint16_t)
+                                              : (uint32_t)sizeof(float);
+        const uint64_t kv_row = (uint64_t)n_kv_heads * head_dim;
+        const uint64_t cache_bytes = (uint64_t)cache_cap * kv_row * elem_bytes;
+        const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+        const uint64_t heads_bytes = q_bytes; /* output is [n_tok, n_head, head_dim] */
+        if (ds4_gpu_tensor_bytes(heads) < heads_bytes ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(key_cache) < cache_bytes ||
+            ds4_gpu_tensor_bytes(value_cache) < cache_bytes) {
+            fprintf(stderr, "ds4: Metal Qwen attention undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_hot_pipeline(g_qwen_attention_gqa_pipeline,
+                                 "kernel_qwen_attention_gqa");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        struct {
+            uint32_t pos0, n_tokens, cache_len, cache_cap;
+            uint32_t n_head, n_kv_heads, head_dim, cache_f16;
+            uint32_t pad0, pad1;
+            float scale;
+        } args = {
+            pos0, n_tokens, cache_len, cache_cap,
+            n_head, n_kv_heads, head_dim, cache_f16 ? 1u : 0u,
+            0u, 0u, 1.0f / sqrtf((float)head_dim),
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(key_cache)
+                offset:ds4_gpu_tensor_offset(key_cache) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(value_cache)
+                offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(heads)
+                offset:ds4_gpu_tensor_offset(heads) atIndex:4];
+        /* scratch: 256 floats (reduction) + cache_len floats (scores). */
+        [enc setThreadgroupMemoryLength:(256u + (NSUInteger)cache_len) * sizeof(float)
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen attention_gqa")) return 0;
+    }
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- * Model-specific Metal configuration registry.
  *
  * ds4_metal_config groups the dispatch parameters a Metal backend tunes per a
- * given model. configure_metal_for_model() selects sensible defaults based on
- * the model's file magic. The Qwen 3.6 27B entry maps the model's GQA + SwiGLU
- * + RMSNorm + RoPE requirements onto the existing Metal kernels.
+ * given model, plus a ready flag per GQA pipeline so the caller can assert the
+ * Qwen attention path is actually wired up (not just flagged). For Qwen 3.6 27B
+ * configure_metal_for_model() resolves the kernel_qwen_* pipelines so the graph
+ * forward in ds4.c can route tensors through them.
  * -------------------------------------------------------------------------- */
 struct ds4_metal_config {
     uint32_t threads_per_threadgroup;
@@ -43275,6 +43443,11 @@ struct ds4_metal_config {
     bool use_rmsnorm;
     bool use_rope;
     uint32_t rope_dim;
+    /* True once the Qwen GQA pipelines (kernel_qwen_store_kv /
+     * kernel_qwen_attention_gqa) have been resolved by this call, so the graph
+     * forward can gate on a real route instead of a metadata-only flag. */
+    bool qwen_gqa_pipelines_ready;
+    uint32_t pad0;
 };
 
 void configure_metal_for_model(struct ds4_metal_config *metal_config,
@@ -43290,11 +43463,17 @@ void configure_metal_for_model(struct ds4_metal_config *metal_config,
     metal_config->use_rmsnorm = false;
     metal_config->use_rope = false;
     metal_config->rope_dim = 0;
+    metal_config->qwen_gqa_pipelines_ready = false;
+    metal_config->pad0 = 0;
 
     if (!model_config) return;
 
-    /* Qwen 3.6 27B Metal configuration. */
+    /* Qwen 3.6 27B: standard transformer (GQA + SwiGLU + RMSNorm + RoPE).
+     * Resolve the GQA pipelines now so the graph forward can route tensors
+     * through kernel_qwen_store_kv / kernel_qwen_attention_gqa rather than the
+     * DeepSeek MLA / GLM indexer kernels. */
     if (model_config->file_id == DS4_FILE_MAGIC_QWEN36_27B) {
+        if (!g_initialized && !ds4_gpu_init()) return;
         metal_config->threads_per_threadgroup = 512;
         metal_config->max_threads_per_threadgroup = 1024;
         metal_config->threadgroup_size.w = 32;
@@ -43305,5 +43484,16 @@ void configure_metal_for_model(struct ds4_metal_config *metal_config,
         metal_config->use_rmsnorm = true;
         metal_config->use_rope = true;
         metal_config->rope_dim = model_config->rope_dim;
+        if (!g_qwen_store_kv_pipeline) {
+            g_qwen_store_kv_pipeline =
+                ds4_gpu_get_pipeline("kernel_qwen_store_kv");
+        }
+        if (!g_qwen_attention_gqa_pipeline) {
+            g_qwen_attention_gqa_pipeline =
+                ds4_gpu_get_pipeline("kernel_qwen_attention_gqa");
+        }
+        metal_config->qwen_gqa_pipelines_ready =
+            (g_qwen_store_kv_pipeline != nil &&
+             g_qwen_attention_gqa_pipeline != nil);
     }
 }
