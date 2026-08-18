@@ -66712,3 +66712,38 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+/* --------------------------------------------------------------------------
+ * Model configuration registry: Qwen 3.6 27B
+ *
+ * Architecture per https://huggingface.co/Qwen/Qwen3.6-27B:
+ * 80 layers, 8192 hidden, 64 attn heads, 8 KV heads (GQA),
+ * 22016 intermediate, 32768 max seq, 152064 vocab, RoPE dim 128 / base 500000.
+ * RMSNorm + SwiGLU activation.
+ * -------------------------------------------------------------------------- */
+static const struct ds4_model_config qwen36_27b_config = {
+    .num_layers = 80,
+    .hidden_size = 8192,
+    .num_attention_heads = 64,
+    .num_key_value_heads = 8,
+    .intermediate_size = 22016,
+    .max_seq_len = 32768,
+    .vocab_size = 152064,
+    .rope_dim = 128,
+    .rope_base = 500000.0f,
+    .norm_type = DS4_NORM_RMS,
+    .mlp_activation = DS4_ACTIVATION_SWIGLU,
+    .attention_type = DS4_ATTENTION_GQA,
+    .model_name = "qwen36-27b",
+    .file_id = DS4_FILE_MAGIC_QWEN36_27B,
+    .quantization_version = 1,
+};
+
+const struct ds4_model_config *ds4_get_model_config(ds4_model_type type) {
+    switch (type) {
+        case DS4_MODEL_QWEN36_27B:
+            return &qwen36_27b_config;
+        default:
+            return NULL;
+    }
+}

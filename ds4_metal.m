@@ -43257,3 +43257,53 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
     (void)enabled;
 }
+
+/* --------------------------------------------------------------------------
+ * Model-specific Metal configuration registry.
+ *
+ * ds4_metal_config groups the dispatch parameters a Metal backend tunes per a
+ * given model. configure_metal_for_model() selects sensible defaults based on
+ * the model's file magic. The Qwen 3.6 27B entry maps the model's GQA + SwiGLU
+ * + RMSNorm + RoPE requirements onto the existing Metal kernels.
+ * -------------------------------------------------------------------------- */
+struct ds4_metal_config {
+    uint32_t threads_per_threadgroup;
+    uint32_t max_threads_per_threadgroup;
+    struct { uint32_t w, h, d; } threadgroup_size; /* MTLSize */
+    bool use_flash_attention;
+    bool use_swiglu;
+    bool use_rmsnorm;
+    bool use_rope;
+    uint32_t rope_dim;
+};
+
+void configure_metal_for_model(struct ds4_metal_config *metal_config,
+                               const struct ds4_model_config *model_config) {
+    /* Start from safe defaults. */
+    metal_config->threads_per_threadgroup = 256;
+    metal_config->max_threads_per_threadgroup = 1024;
+    metal_config->threadgroup_size.w = 32;
+    metal_config->threadgroup_size.h = 8;
+    metal_config->threadgroup_size.d = 1;
+    metal_config->use_flash_attention = false;
+    metal_config->use_swiglu = false;
+    metal_config->use_rmsnorm = false;
+    metal_config->use_rope = false;
+    metal_config->rope_dim = 0;
+
+    if (!model_config) return;
+
+    /* Qwen 3.6 27B Metal configuration. */
+    if (model_config->file_id == DS4_FILE_MAGIC_QWEN36_27B) {
+        metal_config->threads_per_threadgroup = 512;
+        metal_config->max_threads_per_threadgroup = 1024;
+        metal_config->threadgroup_size.w = 32;
+        metal_config->threadgroup_size.h = 16;
+        metal_config->threadgroup_size.d = 1;
+        metal_config->use_flash_attention = true;
+        metal_config->use_swiglu = true;
+        metal_config->use_rmsnorm = true;
+        metal_config->use_rope = true;
+        metal_config->rope_dim = model_config->rope_dim;
+    }
+}

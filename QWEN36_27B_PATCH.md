@@ -1,102 +1,94 @@
-# Patch for Qwen 3.6 27B Support in ds4
+# Qwen 3.6 27B support in ds4
 
 ## Overview
-This patch adds support for Qwen/Qwen3.6-27B model with Metal backend to ds4.
 
-## Files Added
-1. `qwen36_27b_config.h` - Model configuration header
-2. `qwen36_27b_metal.h` - Metal-specific configuration header
+`qwen36_27b.patch` adds registration of the [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
+model with the ds4 Metal backend. It is a standard `git diff` and is applied
+with `git apply`.
 
-## Files to Modify
+The patch introduces a small, model-agnostic configuration registry
+(`struct ds4_model_config`) that is intentionally separate from the
+DeepSeek/GLM-specific `ds4_shape` table. Additional architectures can be
+registered the same way without touching the inference core.
 
-### 1. ds4.h
+## Files
 
-#### Add Model Type Enum
-Find the `ds4_model_type` or `enum ds4_model` definition and add:
-```c
-DS4_MODEL_QWEN36_27B,
-```
+| File                         | Purpose                                              |
+|------------------------------|------------------------------------------------------|
+| `qwen36_27b.patch`           | git diff against `ds4.h`, `ds4.c`, `ds4_metal.m`    |
+| `apply_qwen36_27b_patch.sh`  | wrapper that validates then applies the patch         |
+| `qwen36_27b_config.h`        | architecture constants + `extern` config declaration |
+| `qwen36_27b_metal.h`         | tuned Metal dispatch constants + function declaration |
 
-Before the closing of the enum (usually before `DS4_MODEL_COUNT` or similar).
+## What the patch changes
 
-#### Add File Magic
-Find the file magic definitions and add:
-```c
-DS4_FILE_MAGIC_QWEN36_27B = 0xQW3627B0,
-```
+### `ds4.h`
 
-#### Add Model Configuration
-Find where other model configurations are declared (look for `static const struct ds4_model_config` for other models) and add:
-```c
-extern const struct ds4_model_config qwen36_27b_config;
-```
+Adds the model configuration registry just before the closing `#endif`:
 
-### 2. ds4.c or ds4_model.c
+- `#define DS4_FILE_MAGIC_QWEN36_27B` on-disk file magic.
+- `enum ds4_norm_type { DS4_NORM_LAYER, DS4_NORM_RMS }`.
+- `enum ds4_activation { DS4_ACTIVATION_GELU, DS4_ACTIVATION_SWIGLU }`.
+- `enum ds4_attention_type { DS4_ATTENTION_MHA, DS4_ATTENTION_GQA }`.
+- `enum ds4_model_type { DS4_MODEL_QWEN36_27B, DS4_MODEL_COUNT }`.
+- `struct ds4_model_config { ... }` and the lookup prototype
+  `ds4_get_model_config()`.
 
-#### Register Model Configuration
-Find the model registration section and add:
-```c
-case DS4_MODEL_QWEN36_27B:
-    return &qwen36_27b_config;
-```
+### `ds4.c`
 
-Or if using a registration macro:
-```c
-DS4_MODEL_REGISTER(QWEN36_27B, qwen36_27b_config);
-```
+Appends the `qwen36_27b_config` definition (80 layers, 8192 hidden, 64 attn
+heads, 8 KV heads / GQA, 22016 intermediate, 32768 max seq, 152064 vocab,
+RoPE dim 128 / base 500000, RMSNorm, SwiGLU) and the `ds4_get_model_config()`
+switch that returns it for `DS4_MODEL_QWEN36_27B`.
 
-### 3. ds4_metal.m
+### `ds4_metal.m`
 
-#### Add Metal Configuration
-Find the Metal configuration setup (look for `ds4_metal_config` or similar) and add:
-```objectivec
-if (model_config->file_id == DS4_FILE_MAGIC_QWEN36_27B) {
-    metal_config.threads_per_threadgroup = 512;
-    metal_config.max_threads_per_threadgroup = 1024;
-    metal_config.threadgroup_size = MTLSizeMake(32, 16, 1);
-    metal_config.use_flash_attention = true;
-    metal_config.use_swiglu = true;
-    metal_config.use_rmsnorm = true;
-    metal_config.use_rope = true;
-    metal_config.rope_dim = 128;
-}
-```
+Appends `struct ds4_metal_config` and `configure_metal_for_model()`, which
+populates sensible Metal dispatch defaults and, for the Qwen 3.6 27B file
+magic, enables flash attention, SwiGLU, RMSNorm, RoPE and the model's rope dim.
 
-## Model Architecture Details
+## Model architecture
 
-Qwen 3.6 27B uses the following architecture:
-- **Layers**: 80
-- **Hidden Size**: 8192
-- **Attention Heads**: 64
-- **Key/Value Heads**: 8 (Grouped Query Attention)
-- **Intermediate Size**: 22016
-- **Max Sequence Length**: 32768
-- **Vocabulary Size**: 152064
-- **RoPE Dimension**: 128
-- **RoPE Base**: 500000.0
-- **Normalization**: RMSNorm
-- **MLP Activation**: SwiGLU
-- **Attention**: Grouped Query Attention (GQA)
+- Layers: 80
+- Hidden size: 8192
+- Attention heads: 64
+- Key/Value heads: 8 (Grouped Query Attention)
+- Intermediate size: 22016
+- Max sequence length: 32768
+- Vocabulary size: 152064
+- RoPE dimension: 128
+- RoPE base: 500000.0
+- Normalization: RMSNorm
+- MLP activation: SwiGLU
+- Attention: Grouped Query Attention (GQA)
 
-## Metal Kernel Support
+## Metal kernel support
 
-The existing Metal kernels in the `metal/` directory already support all required operations:
-- `dense.metal` - Matrix multiplication
+The existing Metal kernels in `metal/` already cover every operation Qwen
+3.6 27B needs; no new kernels are created:
+
+- `dense.metal` - matrix multiplication
 - `norm.metal` - RMSNorm
 - `glu.metal` - SwiGLU activation
-- `rope.metal` - Rotary Position Embedding
-- `flash_attn.metal` - Flash Attention / Grouped Query Attention
-- `softmax.metal` - Softmax
+- `rope.metal` - rotary position embedding
+- `flash_attn.metal` - flash attention / grouped query attention
+- `softmax.metal` - softmax
 
-No new Metal kernels need to be created for this model.
+## Applying
+
+```sh
+./apply_qwen36_27b_patch.sh          # validate + apply
+./apply_qwen36_27b_patch.sh --check  # validate only
+```
+
+or directly:
+
+```sh
+git apply qwen36_27b.patch
+```
 
 ## Testing
 
-After applying this patch:
-1. The model should be selectable with `--model qwen36-27b` or similar
-2. Metal backend should work on macOS with Apple Silicon
-3. The model should load and run with the specified architecture parameters
-
-## References
-- Model: https://huggingface.co/Qwen/Qwen3.6-27B
-- Original ds4: https://github.com/antirez/ds4
+After applying the patch the model config is reachable through
+`ds4_get_model_config(DS4_MODEL_QWEN36_27B)`, and Metal dispatch parameters
+through `configure_metal_for_model()`.
