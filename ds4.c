@@ -5878,7 +5878,10 @@ static void config_validate_qwen_model(const ds4_model *m) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 
     const uint32_t n_layer = required_u32(m, "qwen35.block_count");
-    const uint64_t n_ctx = required_u64_compat(m, "general.context_length");
+    uint64_t n_ctx = 0;
+    if (!model_get_u64_compat(m, "general.context_length", &n_ctx)) {
+        n_ctx = required_u64_compat(m, "qwen35.context_length");
+    }
     const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
     const uint32_t n_vocab = required_u32(m, "general.vocab_size");
     uint32_t n_ff_dense = 0;
