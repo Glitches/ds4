@@ -5885,7 +5885,9 @@ static void config_validate_qwen_model(const ds4_model *m) {
     const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
     uint32_t n_vocab = 0;
     if (!model_get_u32(m, "general.vocab_size", &n_vocab)) {
-        n_vocab = required_u32(m, "qwen35.vocab_size");
+        if (!model_get_u32(m, "qwen35.vocab_size", &n_vocab)) {
+            n_vocab = required_u32(m, "vocab_size");
+        }
     }
     uint32_t n_ff_dense = 0;
     if (!model_get_u32(m, "qwen35.feed_forward_length", &n_ff_dense)) {
