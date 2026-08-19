@@ -1,5 +1,42 @@
 # Qwen 3.6 27B support in ds4
 
+## STATUS — READ FIRST
+
+**This branch does NOT support running the real Qwen 3.6 27B model end-to-end.**
+
+The real `Qwen/Qwen3.6-27B` (GGUF arch `qwen35`, see
+[huggingface.co/Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) and
+[ggml-org/Qwen3.6-27B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-27B-GGUF))
+is a **hybrid linear/full-attention multimodal model**:
+
+- 64 layers in a 3:1 pattern — 75% `linear_attention` (Gated DeltaNet, recurrent
+  state, **no per-position KV cache**) and 25% `full_attention` (GQA)
+- `hidden_size` 5120, `num_attention_heads` 24, `num_key_value_heads` 4,
+  `head_dim` 256, `intermediate_size` 17408, `vocab_size` 248320
+- `rope_theta` 1e7, `partial_rotary_factor` 0.25 (only 64 of 256 dims rotate)
+- vision encoder + projector (multimodal)
+
+The Metal kernels committed in this branch (`kernel_qwen_store_kv`,
+`kernel_qwen_attention_gqa` in `metal/qwen_gqa.metal`) implement **standard GQA
+with a per-position KV cache and full rotary**. They can neither express the
+Gated-DeltaNet linear-attention layers nor `head_dim 256` nor partial rotary.
+
+**What this branch DOES provide:**
+- A correct `DS4_SHAPE_QWEN36_27B` shape table with the real qwen35 dimensions
+- A `qwen35` loader branch in `config_validate_model()` so a Qwen 3.6 27B GGUF
+  is recognised (instead of failing with `unsupported DeepSeek4 shape`)
+- A GQA kernel + graph-forward prototype that is valid for a *standard* dense
+  GQA transformer, kept as scaffolding for the full-attention layers
+- A macOS smoke-test gate (`tests/qwen_metal_smoke.sh`)
+
+**What is still required to run the real model** (tracked below under
+"Remaining work") is a new attention backend: Gated-DeltaNet linear-attention
+kernels, full-attention kernels extended to `head_dim 256` + partial rotary,
+per-layer-type dispatch, and a recurrent state allocator. This is substantial
+new GPU work, not a parameter fix.
+
+
+
 ## Overview
 
 `qwen36_27b.patch` adds registration of the [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
@@ -129,6 +166,47 @@ magic, enables flash attention, SwiGLU, RMSNorm, RoPE and the model's rope dim.
   framework, so `ds4_metal.m` / `metal/qwen_gqa.metal` could not be compiled
   or run here. `ds4.c` / `ds4_gpu.h` were syntax-checked (see Verification).
   Build + smoke test against a real Qwen 3.6 27B GGUF must happen on macOS.
+
+## Remaining work (real qwen35 model)
+
+The kernels committed here target a *standard* dense GQA transformer and are
+**insufficient for the real Qwen 3.6 27B** (hybrid linear/full attention).
+Closing the gap is substantial new GPU work. Estimated components:
+
+1. **Gated-DeltaNet linear-attention kernel (new).** ~48 of 64 layers use
+   linear attention with a recurrent state matrix (no per-position KV cache).
+   Needs: a per-token state-update kernel (delta rule + gate), a state-output
+   matvec, and a per-layer recurrent-state tensor allocator in `ds4_session`
+   (state shape ~ `[n_value_heads * value_head_dim, key_head_dim]`, reset on
+   rewind). No such generic recurrent kernel exists in ds4 today; the closest
+   precedent (`kernel_mul_mv_f16_f32_pair_compressor_store_4` in
+   `metal/dense.metal`) is MLA-compressor-specific and not directly reusable.
+   **Effort: largest single item.**
+2. **Full-attention kernel extended to `head_dim 256` + partial rotary.** The
+   16 full-attention layers use GQA but with `head_dim 256` (current kernel
+   assumes 128) and `partial_rotary_factor 0.25` (rotate only 64 of 256 dims;
+   current kernel rotates all). `kernel_qwen_attention_gqa` and the RoPE
+   helper must be generalised.
+3. **Per-layer-type dispatch.** `qwen_graph_forward_token` currently treats
+   all layers identically. It must branch on `layer_types[i]`
+   (`linear_attention` vs `full_attention`) and route to the right kernel,
+   allocating KV cache only for the 16 full-attention layers.
+4. **Multimodal handling.** The model is vision+text. For text-only inference
+   the loader/graph must tolerate/ignore vision tensors and `image_token_id`
+   rather than require them.
+5. **Tensor-name binding.** `weights_bind_qwen_layer()` binds `attn_q/k/v/o`
+   + `ffn_gate/up/down`. The qwen35 GGUF tensor names differ (linear-attention
+   has `l_*` projections, conv kernel, gates) and must be re-bound against the
+   real GGUF tensor list.
+6. **GGUF metadata keys.** Confirm the exact `qwen35.*` key names from a real
+   GGUF (this branch uses the standard `block_count` / `attention.*` /
+   `rope.*` names, which match the upstream config but should be verified
+   against the actual GGUF header).
+
+A reasonable sequencing: confirm GGUF tensor names + metadata (item 6) first,
+then item 3 + 2 (extend the existing full-attention path so the 16 GQA layers
+work), then item 1 (the new linear-attention backend), then item 4/5 cleanup.
+
 
 ## macOS validation
 

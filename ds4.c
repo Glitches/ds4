@@ -615,22 +615,28 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
-/* Qwen 3.6 27B: standard transformer (GQA + dense SwiGLU FFN + RMSNorm +
- * RoPE). No MLA low-rank, no indexer, no MoE -- n_key_mla/n_value_mla/n_kv_lora
- * are zero and the GQA path (metal/qwen_gqa.metal) keeps its own KV cache with
- * n_kv_heads rows per position. RoPE base 500000 per the HF config. */
+/* Qwen 3.6 27B (arch `qwen35`): hybrid linear/full attention (3 linear
+ * Gated-DeltaNet layers then 1 full-attention layer, repeated), head_dim 256,
+ * partial rotary factor 0.25, RoPE theta 1e7. Dimensions from the upstream
+ * config.json (Qwen/Qwen3.6-27B). NOTE: this shape table records the real model
+ * dimensions, but the kernels committed in this branch (kernel_qwen_store_kv /
+ * kernel_qwen_attention_gqa) implement *standard* GQA and do NOT implement the
+ * linear-attention (Gated DeltaNet) layers, head_dim 256, or partial rotary.
+ * End-to-end inference of the real model is therefore NOT supported yet; this
+ * table + the qwen35 loader branch exist so the GGUF is recognised instead of
+ * failing with 'unsupported DeepSeek4 shape'. See QWEN36_27B_PATCH.md. */
 static const ds4_shape DS4_SHAPE_QWEN36_27B = {
     .name = "Qwen 3.6 27B",
     .family = DS4_MODEL_FAMILY_QWEN36_27B,
     .variant = DS4_VARIANT_FLASH,
-    .n_layer = 80,
-    .n_embd = 8192,
-    .n_vocab = 152064,
-    .n_head = 64,
-    .n_head_kv = 8,
-    .n_head_dim = 128,
-    .n_value_dim = 128,
-    .n_rot = 128,
+    .n_layer = 64,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,                     /* partial_rotary_factor 0.25 * 256 */
     .n_out_group = 0,
     .n_lora_q = 0,
     .n_lora_o = 0,
@@ -638,7 +644,7 @@ static const ds4_shape DS4_SHAPE_QWEN36_27B = {
     .n_expert_used = 0,
     .n_expert_shared = 0,
     .n_ff_exp = 0,
-    .n_ff_dense = 22016,
+    .n_ff_dense = 17408,
     .n_hash_layer = 0,
     .n_swa = 0,
     .n_indexer_head = 0,
@@ -647,7 +653,7 @@ static const ds4_shape DS4_SHAPE_QWEN36_27B = {
     .n_hc = 0,
     .n_hc_sinkhorn_iter = 0,
     .n_nextn_predict = 0,
-    .n_leading_dense = 80,
+    .n_leading_dense = 64,
     .n_kv_lora = 0,
     .n_key_mla = 0,
     .n_value_mla = 0,
@@ -655,12 +661,12 @@ static const ds4_shape DS4_SHAPE_QWEN36_27B = {
     .hc_eps = 0.0f,
     .expert_weight_scale = 0.0f,
     .swiglu_clamp_exp = 0.0f,
-    .rope_freq_base = 500000.0f,
+    .rope_freq_base = 10000000.0f,
     .rope_scale_factor = 1.0f,
     .rope_yarn_beta_fast = 0.0f,
     .rope_yarn_beta_slow = 0.0f,
     .compress_rope_freq_base = 0.0f,
-    .rope_orig_ctx = 32768,
+    .rope_orig_ctx = 262144,
 };
 
 static const ds4_shape DS4_SHAPE_GLM52 = {
@@ -5871,15 +5877,15 @@ static void config_validate_qwen_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_QWEN36_27B;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 
-    const uint32_t n_layer = required_u32(m, "qwen3.block_count");
-    const uint64_t n_ctx = required_u64_compat(m, "qwen3.context_length");
-    const uint32_t n_embd = required_u32(m, "qwen3.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "qwen3.vocab_size");
-    const uint32_t n_ff_dense = required_u32(m, "qwen3.feed_forward_length");
-    const uint32_t n_head = required_u32(m, "qwen3.attention.head_count");
-    const uint32_t n_head_kv = required_u32(m, "qwen3.attention.head_count_kv");
-    const uint32_t n_head_dim = required_u32(m, "qwen3.attention.key_length");
-    const uint32_t n_rot = required_u32(m, "qwen3.rope.dimension_count");
+    const uint32_t n_layer = required_u32(m, "qwen35.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "qwen35.context_length");
+    const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "qwen35.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "qwen35.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "qwen35.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "qwen35.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "qwen35.attention.key_length");
+    const uint32_t n_rot = required_u32(m, "qwen35.rope.dimension_count");
 
     config_expect_u32("block_count", n_layer, DS4_N_LAYER);
     config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
@@ -5891,9 +5897,9 @@ static void config_validate_qwen_model(const ds4_model *m) {
     config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
     config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
 
-    const float rope_freq_base = required_f32(m, "qwen3.rope.freq_base");
+    const float rope_freq_base = required_f32(m, "qwen35.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
-    const float rms_eps = required_f32(m, "qwen3.attention.layer_norm_rms_epsilon");
+    const float rms_eps = required_f32(m, "qwen35.attention.layer_norm_rms_epsilon");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
 
     config_validate_fixed_shape(n_layer);
@@ -5907,7 +5913,7 @@ static void config_validate_model(const ds4_model *m) {
         return;
     }
     if (model_get_string(m, "general.architecture", &arch) &&
-        ds4_streq(arch, "qwen3")) {
+        ds4_streq(arch, "qwen35")) {
         config_validate_qwen_model(m);
         return;
     }
