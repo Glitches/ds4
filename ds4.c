@@ -5883,7 +5883,10 @@ static void config_validate_qwen_model(const ds4_model *m) {
         n_ctx = required_u64_compat(m, "qwen35.context_length");
     }
     const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "general.vocab_size");
+    uint32_t n_vocab = 0;
+    if (!model_get_u32(m, "general.vocab_size", &n_vocab)) {
+        n_vocab = required_u32(m, "qwen35.vocab_size");
+    }
     uint32_t n_ff_dense = 0;
     if (!model_get_u32(m, "qwen35.feed_forward_length", &n_ff_dense)) {
         n_ff_dense = required_u32(m, "qwen35.intermediate_size");
