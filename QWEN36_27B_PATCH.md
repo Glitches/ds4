@@ -130,6 +130,49 @@ magic, enables flash attention, SwiGLU, RMSNorm, RoPE and the model's rope dim.
   or run here. `ds4.c` / `ds4_gpu.h` were syntax-checked (see Verification).
   Build + smoke test against a real Qwen 3.6 27B GGUF must happen on macOS.
 
+## macOS validation
+
+The sandbox used for development is Linux x86_64 without the Metal framework,
+so the Metal sources (`ds4_metal.m`, `metal/qwen_gqa.metal`) cannot be compiled
+or run there. End-to-end validation must happen on a Mac with a Metal-capable
+GPU and a real Qwen 3.6 27B GGUF.
+
+The loader now recognises a Qwen3-architecture GGUF: `config_validate_model()`
+branches on `general.architecture == "qwen3"`, calls
+`config_validate_qwen_model()` which sets `g_ds4_shape = DS4_SHAPE_QWEN36_27B`,
+and validates the GGUF keys (`qwen3.block_count`, `qwen3.embedding_length`,
+`qwen3.attention.head_count`, `qwen3.attention.head_count_kv`,
+`qwen3.attention.key_length`, `qwen3.rope.dimension_count`,
+`qwen3.rope.freq_base`, `qwen3.attention.layer_norm_rms_epsilon`,
+`qwen3.feed_forward_length`, `qwen3.vocab_size`, `qwen3.context_length`)
+against the fixed shape table.
+
+Steps on macOS:
+
+```sh
+# 1. Build the Metal binary.
+make ds4
+
+# 2. Confirm the GGUF is recognised (prints "arch:  qwen3" and the shape).
+./ds4 -m models/Qwen3.6-27B-Q4_K_M.gguf -i </dev/null 2>&1 | head -20
+
+# 3. Smoke gate: greedy generation, output must be non-empty + non-corrupt.
+DS4_QWEN_MODEL=models/Qwen3.6-27B-Q4_K_M.gguf \
+DS4_QWEN_CTX=4096 \
+DS4_QWEN_GEN=48 \
+./tests/qwen_metal_smoke.sh
+
+# or via make:
+make test-qwen-metal-smoke
+```
+
+The smoke gate (`tests/qwen_metal_smoke.sh`, modelled on
+`tests/glm_long_context_smoke.sh`) runs greedy generation (`--temp 0`) and fails
+on empty output, non-printable bytes, or known stream-corruption markers. It
+exercises the full GQA path: `kernel_qwen_store_kv` + `kernel_qwen_attention_gqa`
+KV cache, the per-layer KV allocation in `qwen_graph_alloc()`, and the
+`qwen_graph_forward_token()` decode loop wired into `ds4_session_eval()`.
+
 ## Applying
 
 ```sh

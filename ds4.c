@@ -615,6 +615,54 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* Qwen 3.6 27B: standard transformer (GQA + dense SwiGLU FFN + RMSNorm +
+ * RoPE). No MLA low-rank, no indexer, no MoE -- n_key_mla/n_value_mla/n_kv_lora
+ * are zero and the GQA path (metal/qwen_gqa.metal) keeps its own KV cache with
+ * n_kv_heads rows per position. RoPE base 500000 per the HF config. */
+static const ds4_shape DS4_SHAPE_QWEN36_27B = {
+    .name = "Qwen 3.6 27B",
+    .family = DS4_MODEL_FAMILY_QWEN36_27B,
+    .variant = DS4_VARIANT_FLASH,
+    .n_layer = 80,
+    .n_embd = 8192,
+    .n_vocab = 152064,
+    .n_head = 64,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,
+    .n_out_group = 0,
+    .n_lora_q = 0,
+    .n_lora_o = 0,
+    .n_expert = 0,
+    .n_expert_used = 0,
+    .n_expert_shared = 0,
+    .n_ff_exp = 0,
+    .n_ff_dense = 22016,
+    .n_hash_layer = 0,
+    .n_swa = 0,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 0,
+    .n_hc_sinkhorn_iter = 0,
+    .n_nextn_predict = 0,
+    .n_leading_dense = 80,
+    .n_kv_lora = 0,
+    .n_key_mla = 0,
+    .n_value_mla = 0,
+    .rms_eps = 1.0e-6f,
+    .hc_eps = 0.0f,
+    .expert_weight_scale = 0.0f,
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 500000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 32768,
+};
+
 static const ds4_shape DS4_SHAPE_GLM52 = {
     .name = "GLM 5.2",
     .family = DS4_MODEL_FAMILY_GLM_DSA,
@@ -5813,11 +5861,54 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+/* Qwen 3.6 27B: standard transformer (GQA + dense SwiGLU + RMSNorm + RoPE).
+ * There is no MLA, no indexer and no MoE, so only the basic dimensions need
+ * to be read from the GGUF; everything that does not exist for a dense GQA
+ * model is expected to be zero (which DS4_SHAPE_QWEN36_27B already encodes).
+ * The GGUF keys for the Qwen3 architecture are emitted with the `qwen3.`
+ * prefix by upstream conversion scripts. */
+static void config_validate_qwen_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN36_27B;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "qwen3.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "qwen3.context_length");
+    const uint32_t n_embd = required_u32(m, "qwen3.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "qwen3.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "qwen3.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "qwen3.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "qwen3.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "qwen3.attention.key_length");
+    const uint32_t n_rot = required_u32(m, "qwen3.rope.dimension_count");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
+
+    const float rope_freq_base = required_f32(m, "qwen3.rope.freq_base");
+    config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
+    const float rms_eps = required_f32(m, "qwen3.attention.layer_norm_rms_epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+
+    config_validate_fixed_shape(n_layer);
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) &&
         ds4_streq(arch, "glm-dsa")) {
         config_validate_glm_dsa_model(m);
+        return;
+    }
+    if (model_get_string(m, "general.architecture", &arch) &&
+        ds4_streq(arch, "qwen3")) {
+        config_validate_qwen_model(m);
         return;
     }
     config_validate_deepseek4_model(m);
