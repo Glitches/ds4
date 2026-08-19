@@ -5878,13 +5878,17 @@ static void config_validate_qwen_model(const ds4_model *m) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 
     const uint32_t n_layer = required_u32(m, "qwen35.block_count");
-    const uint64_t n_ctx = required_u64_compat(m, "qwen35.context_length");
+    const uint64_t n_ctx = required_u64_compat(m, "general.context_length");
     const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "qwen35.vocab_size");
-    const uint32_t n_ff_dense = required_u32(m, "qwen35.feed_forward_length");
+    const uint32_t n_vocab = required_u32(m, "general.vocab_size");
+    uint32_t n_ff_dense = 0;
+    if (!model_get_u32(m, "qwen35.feed_forward_length", &n_ff_dense)) {
+        n_ff_dense = required_u32(m, "qwen35.intermediate_size");
+    }
     const uint32_t n_head = required_u32(m, "qwen35.attention.head_count");
     const uint32_t n_head_kv = required_u32(m, "qwen35.attention.head_count_kv");
     const uint32_t n_head_dim = required_u32(m, "qwen35.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "qwen35.attention.value_length");
     const uint32_t n_rot = required_u32(m, "qwen35.rope.dimension_count");
 
     config_expect_u32("block_count", n_layer, DS4_N_LAYER);
@@ -5895,6 +5899,7 @@ static void config_validate_qwen_model(const ds4_model *m) {
     config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
     config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
     config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
     config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
 
     const float rope_freq_base = required_f32(m, "qwen35.rope.freq_base");
