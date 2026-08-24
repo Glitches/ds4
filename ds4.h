@@ -478,4 +478,57 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+/* --------------------------------------------------------------------------
+ * Model configuration registry.
+ *
+ * ds4_model_config is a model-agnostic description of a transformer family.
+ * It is intentionally independent from the DeepSeek/GLM-specific ds4_shape
+ * table so additional architectures (e.g. Qwen) can be registered without
+ * touching the inference core. Each registered model is selected through a
+ * ds4_model_type enumerator and exposes its on-disk file magic.
+ * -------------------------------------------------------------------------- */
+
+/* File magic used to tag model files on disk. */
+#define DS4_FILE_MAGIC_QWEN36_27B UINT32_C(0x51333627) /* "Q36'" */
+
+typedef enum {
+    DS4_NORM_LAYER,
+    DS4_NORM_RMS,
+} ds4_norm_type;
+
+typedef enum {
+    DS4_ACTIVATION_GELU,
+    DS4_ACTIVATION_SWIGLU,
+} ds4_activation;
+
+typedef enum {
+    DS4_ATTENTION_MHA,
+    DS4_ATTENTION_GQA,
+} ds4_attention_type;
+
+typedef enum {
+    DS4_MODEL_QWEN36_27B,
+    DS4_MODEL_COUNT,
+} ds4_model_type;
+
+struct ds4_model_config {
+    const char *model_name;
+    uint32_t file_id;
+    uint32_t num_layers;
+    uint32_t hidden_size;
+    uint32_t num_attention_heads;
+    uint32_t num_key_value_heads;
+    uint32_t intermediate_size;
+    uint32_t max_seq_len;
+    uint32_t vocab_size;
+    uint32_t rope_dim;
+    float rope_base;
+    ds4_norm_type norm_type;
+    ds4_activation mlp_activation;
+    ds4_attention_type attention_type;
+    uint32_t quantization_version;
+};
+
+const struct ds4_model_config *ds4_get_model_config(ds4_model_type type);
+
 #endif

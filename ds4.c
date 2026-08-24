@@ -484,8 +484,9 @@ enum {
 };
 
 typedef enum {
-    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
-    DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    DS4_MODEL_FAMILY_DEEPSEEK4   = 0,
+    DS4_MODEL_FAMILY_GLM_DSA     = 1,
+    DS4_MODEL_FAMILY_QWEN36_27B  = 2,
 } ds4_model_family;
 
 typedef enum {
@@ -612,6 +613,60 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
     .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+/* Qwen 3.6 27B (arch `qwen35`): hybrid linear/full attention (3 linear
+ * Gated-DeltaNet layers then 1 full-attention layer, repeated), head_dim 256,
+ * partial rotary factor 0.25, RoPE theta 1e7. Dimensions from the upstream
+ * config.json (Qwen/Qwen3.6-27B). NOTE: this shape table records the real model
+ * dimensions, but the kernels committed in this branch (kernel_qwen_store_kv /
+ * kernel_qwen_attention_gqa) implement *standard* GQA and do NOT implement the
+ * linear-attention (Gated DeltaNet) layers, head_dim 256, or partial rotary.
+ * End-to-end inference of the real model is therefore NOT supported yet; this
+ * table + the qwen35 loader branch exist so the GGUF is recognised instead of
+ * failing with 'unsupported DeepSeek4 shape'. See QWEN36_27B_PATCH.md. */
+static const ds4_shape DS4_SHAPE_QWEN36_27B = {
+    .name = "Qwen 3.6 27B",
+    .family = DS4_MODEL_FAMILY_QWEN36_27B,
+    .variant = DS4_VARIANT_FLASH,
+    .n_layer = 64,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,                     /* partial_rotary_factor 0.25 * 256 */
+    .n_out_group = 0,
+    .n_lora_q = 0,
+    .n_lora_o = 0,
+    .n_expert = 0,
+    .n_expert_used = 0,
+    .n_expert_shared = 0,
+    .n_ff_exp = 0,
+    .n_ff_dense = 17408,
+    .n_hash_layer = 0,
+    .n_swa = 0,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 0,
+    .n_hc_sinkhorn_iter = 0,
+    .n_nextn_predict = 0,
+    .n_leading_dense = 64,
+    .n_kv_lora = 0,
+    .n_key_mla = 0,
+    .n_value_mla = 0,
+    .rms_eps = 1.0e-6f,
+    .hc_eps = 0.0f,
+    .expert_weight_scale = 0.0f,
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 262144,
 };
 
 static const ds4_shape DS4_SHAPE_GLM52 = {
@@ -4115,6 +4170,12 @@ typedef struct {
     ds4_tensor *attn_v_b;
     ds4_tensor *attn_sinks;
     ds4_tensor *attn_output;
+    /* Standard-transformer (non-MLA) dense attention weights used by the
+     * Qwen 3.6 27B path. NULL for DeepSeek/GLM families. */
+    ds4_tensor *qwen_attn_q;
+    ds4_tensor *qwen_attn_k;
+    ds4_tensor *qwen_attn_v;
+    ds4_tensor *qwen_attn_o;
     ds4_tensor *attn_output_a;
     ds4_tensor *attn_output_b;
     ds4_tensor *attn_compressor_ape;
@@ -5806,11 +5867,67 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+/* Qwen 3.6 27B: standard transformer (GQA + dense SwiGLU + RMSNorm + RoPE).
+ * There is no MLA, no indexer and no MoE, so only the basic dimensions need
+ * to be read from the GGUF; everything that does not exist for a dense GQA
+ * model is expected to be zero (which DS4_SHAPE_QWEN36_27B already encodes).
+ * The GGUF keys for the Qwen3 architecture are emitted with the `qwen3.`
+ * prefix by upstream conversion scripts. */
+static void config_validate_qwen_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN36_27B;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "qwen35.block_count");
+    uint64_t n_ctx = 0;
+    if (!model_get_u64_compat(m, "general.context_length", &n_ctx)) {
+        n_ctx = required_u64_compat(m, "qwen35.context_length");
+    }
+    const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
+    uint32_t n_vocab = 0;
+    if (!model_get_u32(m, "general.vocab_size", &n_vocab)) {
+        if (!model_get_u32(m, "qwen35.vocab_size", &n_vocab)) {
+            n_vocab = required_u32(m, "vocab_size");
+        }
+    }
+    uint32_t n_ff_dense = 0;
+    if (!model_get_u32(m, "qwen35.feed_forward_length", &n_ff_dense)) {
+        n_ff_dense = required_u32(m, "qwen35.intermediate_size");
+    }
+    const uint32_t n_head = required_u32(m, "qwen35.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "qwen35.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "qwen35.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "qwen35.attention.value_length");
+    const uint32_t n_rot = required_u32(m, "qwen35.rope.dimension_count");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
+    config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
+
+    const float rope_freq_base = required_f32(m, "qwen35.rope.freq_base");
+    config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
+    const float rms_eps = required_f32(m, "qwen35.attention.layer_norm_rms_epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+
+    config_validate_fixed_shape(n_layer);
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) &&
         ds4_streq(arch, "glm-dsa")) {
         config_validate_glm_dsa_model(m);
+        return;
+    }
+    if (model_get_string(m, "general.architecture", &arch) &&
+        ds4_streq(arch, "qwen35")) {
+        config_validate_qwen_model(m);
         return;
     }
     config_validate_deepseek4_model(m);
@@ -5892,9 +6009,29 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
     }
 }
 
+/* Qwen 3.6 27B is a standard transformer: dense Q/K/V/O projections, dense
+ * SwiGLU FFN (gate/up/down), RMSNorm pre/post attention, RoPE on Q and K. No
+ * low-rank Q, no MLA dual-cache, no indexer. The fields bound here are the only
+ * ones the qwen_graph_forward_token path consumes. */
+static void weights_bind_qwen_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm     = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->qwen_attn_q   = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->qwen_attn_k   = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->qwen_attn_v   = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->qwen_attn_o   = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->ffn_norm      = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate      = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+    l->ffn_up        = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+    l->ffn_down      = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN36_27B) {
+        weights_bind_qwen_layer(l, m, il);
         return;
     }
 
@@ -44162,6 +44299,262 @@ static bool glm_graph_mtp_step(
     return true;
 }
 
+/* Per-session state for the Qwen standard-transformer Metal path. The KV caches
+ * are per-layer [cache_cap * n_kv_heads * head_dim]; everything else is scratch
+ * tensor reused across layers within one decode step. */
+typedef struct {
+    ds4_gpu_tensor *cur;            /* hidden state, [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *nxt;            /* next hidden state, swapped with cur */
+    ds4_gpu_tensor *norm;           /* [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *q;              /* [n_tok, n_head*head_dim] f32 */
+    ds4_gpu_tensor *k;              /* [n_tok, n_kv_heads*head_dim] f32 */
+    ds4_gpu_tensor *v;              /* [n_tok, n_kv_heads*head_dim] f32 */
+    ds4_gpu_tensor *heads;          /* attention output [n_tok, n_head*head_dim] */
+    ds4_gpu_tensor *attn_out;      /* [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *after_attn;     /* residual [n_tok, n_embd] f32 */
+    ds4_gpu_tensor *gate;           /* [n_tok, n_ff_dense] f32 */
+    ds4_gpu_tensor *up;             /* [n_tok, n_ff_dense] f32 */
+    ds4_gpu_tensor *mid;            /* swiglu(gate,up) [n_tok, n_ff_dense] */
+    ds4_gpu_tensor *ffn_out;        /* [n_tok, n_embd] f32 */
+    ds4_gpu_tensor **key_cache;     /* [n_layer] */
+    ds4_gpu_tensor **value_cache;   /* [n_layer] */
+    uint32_t cache_cap;
+    uint32_t cache_len;
+    bool ready;
+} ds4_qwen_gpu_graph;
+
+static void qwen_graph_free_tensors(ds4_qwen_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor_free(g->cur); g->cur = NULL;
+    ds4_gpu_tensor_free(g->nxt); g->nxt = NULL;
+    ds4_gpu_tensor_free(g->norm); g->norm = NULL;
+    ds4_gpu_tensor_free(g->q); g->q = NULL;
+    ds4_gpu_tensor_free(g->k); g->k = NULL;
+    ds4_gpu_tensor_free(g->v); g->v = NULL;
+    ds4_gpu_tensor_free(g->heads); g->heads = NULL;
+    ds4_gpu_tensor_free(g->attn_out); g->attn_out = NULL;
+    ds4_gpu_tensor_free(g->after_attn); g->after_attn = NULL;
+    ds4_gpu_tensor_free(g->gate); g->gate = NULL;
+    ds4_gpu_tensor_free(g->up); g->up = NULL;
+    ds4_gpu_tensor_free(g->mid); g->mid = NULL;
+    ds4_gpu_tensor_free(g->ffn_out); g->ffn_out = NULL;
+    if (g->key_cache) {
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) ds4_gpu_tensor_free(g->key_cache[i]);
+        free(g->key_cache); g->key_cache = NULL;
+    }
+    if (g->value_cache) {
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) ds4_gpu_tensor_free(g->value_cache[i]);
+        free(g->value_cache); g->value_cache = NULL;
+    }
+    g->ready = false;
+}
+
+/* Allocate the per-session Qwen graph state for the Metal backend.
+ *
+ * cache_cap is the KV cache row capacity per layer (= ctx_size, one row per
+ * token, no MLA compression). Scratch tensors are sized for single-token
+ * decode (n_tok=1). Returns true on success and sets g->ready. */
+static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t cache_cap) {
+    if (!g || cache_cap == 0) return false;
+    memset(g, 0, sizeof(*g));
+    const uint32_t n_tok = 1u;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t n_kv_heads = DS4_N_HEAD_KV;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_ff = DS4_N_FF_DENSE;
+    const uint32_t q_dim = n_head * head_dim;
+    const uint32_t kv_dim = n_kv_heads * head_dim;
+    const uint64_t f32 = sizeof(float);
+
+    g->cache_cap = cache_cap;
+    g->cache_len = 0;
+
+    g->cur        = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->nxt        = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->norm       = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->q          = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_dim * f32);
+    g->k          = ds4_gpu_tensor_alloc((uint64_t)n_tok * kv_dim * f32);
+    g->v          = ds4_gpu_tensor_alloc((uint64_t)n_tok * kv_dim * f32);
+    g->heads      = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_dim * f32);
+    g->attn_out   = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->after_attn = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+    g->gate       = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_ff * f32);
+    g->up         = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_ff * f32);
+    g->mid        = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_ff * f32);
+    g->ffn_out    = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_embd * f32);
+
+    const uint64_t cache_bytes = (uint64_t)cache_cap * kv_dim * f32;
+    g->key_cache = calloc(DS4_N_LAYER, sizeof(ds4_gpu_tensor *));
+    g->value_cache = calloc(DS4_N_LAYER, sizeof(ds4_gpu_tensor *));
+    bool ok = g->key_cache && g->value_cache;
+    for (uint32_t i = 0; ok && i < DS4_N_LAYER; i++) {
+        g->key_cache[i] = ds4_gpu_tensor_alloc(cache_bytes);
+        g->value_cache[i] = ds4_gpu_tensor_alloc(cache_bytes);
+        if (!g->key_cache[i] || !g->value_cache[i]) ok = false;
+    }
+
+    ok = ok && g->cur && g->nxt && g->norm && g->q && g->k && g->v &&
+         g->heads && g->attn_out && g->after_attn && g->gate && g->up &&
+         g->mid && g->ffn_out;
+    if (!ok) {
+        qwen_graph_free_tensors(g);
+        return false;
+    }
+    g->ready = true;
+    return true;
+}
+
+static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
+    qwen_graph_free_tensors(g);
+}
+
+/* Decode a single token through the Qwen standard-transformer graph on Metal.
+ *
+ * n_tok is 1 here (single-token decode); the path follows the same tensor
+ * conventions as glm_graph_forward_token but routes attention through the GQA
+ * kernels (kernel_qwen_store_kv / kernel_qwen_attention_gqa) instead of the
+ * DeepSeek MLA / GLM indexer family. RoPE is applied to Q and K in place via
+ * ds4_gpu_rope_tail_tensor over the [n_head/n_kv_heads, head_dim] layout.
+ *
+ * Returns true and writes logits_out (n_vocab floats) on success. The Metal
+ * backend is the only target; this function is compiled out under DS4_NO_GPU.
+ */
+static bool qwen_graph_forward_token(
+        ds4_qwen_gpu_graph *g,
+        const ds4_model    *model,
+        const ds4_weights *weights,
+        int                 token,
+        uint32_t            pos,
+        float              *logits_out) {
+    if (!g || !g->ready || !model || !weights || !logits_out) return false;
+    const uint32_t n_tok = 1u;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t n_kv_heads = DS4_N_HEAD_KV;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_rot = DS4_N_ROT;
+    const uint32_t n_ff = DS4_N_FF_DENSE;
+    const float eps = DS4_RMS_EPS;
+    const float freq_base = DS4_ROPE_FREQ_BASE;
+    const float freq_scale = DS4_ROPE_SCALE_FACTOR;
+    const float beta_fast = DS4_ROPE_YARN_BETA_FAST;
+    const float beta_slow = DS4_ROPE_YARN_BETA_SLOW;
+    const uint32_t n_ctx_orig = (uint32_t)DS4_ROPE_ORIG_CTX;
+    const uint32_t q_dim = n_head * head_dim;
+    const uint32_t kv_dim = n_kv_heads * head_dim;
+
+    /* Embedding lookup -> cur ([1, n_embd] f32). */
+    int32_t tok = token;
+    ds4_gpu_tensor *toks = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    if (!toks) return false;
+    bool ok = ds4_gpu_tensor_write(toks, 0, &tok, sizeof(int32_t)) != 0;
+    if (ok) {
+        ok = ds4_gpu_embed_tokens_quant_tensor(
+                g->cur, toks, model->map, model->size,
+                weights->token_embd->abs_offset, weights->token_embd->type,
+                DS4_N_VOCAB, n_tok, n_embd) != 0;
+    }
+    ds4_gpu_tensor_free(toks);
+    if (!ok) return false;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        if (!l->qwen_attn_q || !l->qwen_attn_k || !l->qwen_attn_v ||
+            !l->qwen_attn_o || !l->attn_norm || !l->ffn_norm ||
+            !l->ffn_gate || !l->ffn_up || !l->ffn_down) {
+            return false;
+        }
+
+        /* Pre-attention RMSNorm. */
+        ok = ds4_gpu_rms_norm_weight_tensor(
+                g->norm, g->cur, model->map, model->size,
+                l->attn_norm->abs_offset, n_embd, eps) != 0;
+
+        /* Q/K/V projections (dense, q8_0). */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->q, model->map, model->size, l->qwen_attn_q->abs_offset,
+                n_embd, q_dim, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->k, model->map, model->size, l->qwen_attn_k->abs_offset,
+                n_embd, kv_dim, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->v, model->map, model->size, l->qwen_attn_v->abs_offset,
+                n_embd, kv_dim, g->norm, n_tok) != 0;
+
+        /* RoPE on Q ([n_head, head_dim]) and K ([n_kv_heads, head_dim]). */
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+                g->q, n_tok, n_head, head_dim, n_rot, pos, n_ctx_orig,
+                false, freq_base, freq_scale, 0.0f, 1.0f,
+                beta_fast, beta_slow) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+                g->k, n_tok, n_kv_heads, head_dim, n_rot, pos, n_ctx_orig,
+                false, freq_base, freq_scale, 0.0f, 1.0f,
+                beta_fast, beta_slow) != 0;
+
+        /* Store K/V into the per-layer GQA cache. */
+        if (ok) ok = ds4_gpu_qwen_store_kv_tensor(
+                g->key_cache[il], g->value_cache[il], g->k, g->v,
+                pos, n_tok, g->cache_cap, n_kv_heads, head_dim, false) != 0;
+
+        /* Grouped-query attention (causal, single query token). */
+        const uint32_t cache_len = pos + n_tok;
+        if (ok) ok = ds4_gpu_qwen_attention_gqa_tensor(
+                g->heads, g->q, g->key_cache[il], g->value_cache[il],
+                pos, n_tok, cache_len, g->cache_cap,
+                n_head, n_kv_heads, head_dim, false) != 0;
+
+        /* Output projection + residual. */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->attn_out, model->map, model->size, l->qwen_attn_o->abs_offset,
+                q_dim, n_embd, g->heads, n_tok) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(
+                g->after_attn, g->cur, g->attn_out,
+                n_tok * n_embd) != 0;
+
+        /* Pre-FFN RMSNorm. */
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(
+                g->norm, g->after_attn, model->map, model->size,
+                l->ffn_norm->abs_offset, n_embd, eps) != 0;
+
+        /* SwiGLU FFN: gate, up, swiglu, down. */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->gate, model->map, model->size, l->ffn_gate->abs_offset,
+                n_embd, n_ff, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->up, model->map, model->size, l->ffn_up->abs_offset,
+                n_embd, n_ff, g->norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_swiglu_tensor(
+                g->mid, g->gate, g->up, n_tok * n_ff, 0.0f, 1.0f) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+                g->ffn_out, model->map, model->size, l->ffn_down->abs_offset,
+                n_ff, n_embd, g->mid, n_tok) != 0;
+
+        /* Residual -> nxt, then swap cur/nxt. */
+        if (ok) ok = ds4_gpu_add_tensor(
+                g->nxt, g->after_attn, g->ffn_out,
+                n_tok * n_embd) != 0;
+        if (!ok) return false;
+
+        ds4_gpu_tensor *tmp = g->cur;
+        g->cur = g->nxt;
+        g->nxt = tmp;
+    }
+
+    /* Final norm + output projection -> logits. */
+    ok = ds4_gpu_rms_norm_weight_tensor(
+            g->norm, g->cur, model->map, model->size,
+            weights->output_norm->abs_offset, n_embd, eps) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+            g->attn_out /* reuse as logits scratch */, model->map, model->size,
+            weights->output->abs_offset, n_embd, DS4_N_VOCAB,
+            g->norm, n_tok) != 0;
+    if (ok) ok = ds4_gpu_tensor_read(
+            g->attn_out, 0, logits_out,
+            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    return ok;
+}
+
 static bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -49277,6 +49670,8 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
+    ds4_qwen_gpu_graph qwen_graph;
+    bool qwen_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
     int glm_mtp_draft;
@@ -50097,6 +50492,10 @@ static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 
 static bool ds4_session_is_glm(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+static bool ds4_session_is_qwen(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN36_27B;
 }
 
 #ifndef DS4_NO_GPU
@@ -58625,6 +59024,24 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN36_27B) {
+        /* Qwen 3.6 27B is a standard transformer (GQA + SwiGLU + RMSNorm + RoPE).
+         * It has no MLA compression, so the per-layer KV cache row capacity is
+         * just the context length. Only single-token decode is wired by the
+         * qwen_graph_forward_token path; prefill reuses it token-by-token. */
+        const uint32_t cache_cap = (uint32_t)ctx_size;
+        if (!qwen_graph_alloc(&s->qwen_graph, cache_cap)) {
+            fprintf(stderr, "ds4: Qwen Metal graph alloc failed (cap %u)\n",
+                    cache_cap);
+            free(s);
+            return 1;
+        }
+        s->prefill_cap = cache_cap;
+        ds4_gpu_enable_q8_dequant_gemm();
+        s->qwen_graph_ready = true;
+        *out = s;
+        return 0;
+    }
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
@@ -58814,6 +59231,9 @@ void ds4_session_free(ds4_session *s) {
     else {
         if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
+        } else if (ds4_session_is_qwen(s)) {
+            qwen_graph_free(&s->qwen_graph);
+            s->qwen_graph_ready = false;
         } else {
             metal_graph_free(&s->graph);
         }
@@ -59906,6 +60326,52 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_qwen(s)) {
+        /* Qwen prefill: single-token decode path has no batched prefill kernel
+         * yet, so replay the prompt token-by-token through ds4_session_eval
+         * (which already handles pos = checkpoint.len, KV store, logits). When
+         * the prompt extends a valid checkpoint, only the new tail is replayed;
+         * otherwise the KV caches must be reset and the full prompt replayed. */
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            s->mtp_draft_valid = false;
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint_valid = true;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                const int rc = ds4_session_eval(s, prompt->v[i], err, errlen);
+                if (rc != 0) return rc;
+                if (s->progress && ((i - s->checkpoint.len + 1) % 8 == 0 ||
+                                    i + 1 == prompt->len)) {
+                    s->progress(s->progress_ud, "prefill",
+                                i + 1, prompt->len);
+                }
+            }
+            return 0;
+        }
+        /* Checkpoint diverged: drop KV state and replay from scratch. */
+        s->checkpoint.len = 0;
+        s->checkpoint_valid = false;
+        s->qwen_graph.cache_len = 0;
+        for (int i = 0; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            const int rc = ds4_session_eval(s, prompt->v[i], err, errlen);
+            if (rc != 0) return rc;
+            if (s->progress && ((i + 1) % 8 == 0 || i + 1 == prompt->len)) {
+                s->progress(s->progress_ud, "prefill", i + 1, prompt->len);
+            }
+        }
+        return 0;
+    }
+#endif
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -61669,6 +62135,40 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    /* Qwen 3.6 27B standard-transformer Metal path: single-token decode only.
+     * Handled here before the GLM/DeepSeek/TP machinery so that family's
+     * MLA/indexer-specific graph state is never touched for a Qwen session. */
+    if (ds4_session_is_qwen(s)) {
+        if (!s->qwen_graph_ready) {
+            if (errlen) snprintf(err, errlen, "%s Qwen graph is not initialized",
+                                 ds4_backend_name(s->engine->backend));
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= s->qwen_graph.cache_cap) {
+            if (errlen) snprintf(err, errlen,
+                                 "Qwen Metal context reached (%u)",
+                                 s->qwen_graph.cache_cap);
+            return 1;
+        }
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (!qwen_graph_forward_token(&s->qwen_graph,
+                                      &s->engine->model,
+                                      &s->engine->weights,
+                                      token,
+                                      pos,
+                                      s->logits)) {
+            if (errlen) snprintf(err, errlen, "%s Qwen decode failed",
+                                 ds4_backend_name(s->engine->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->qwen_graph.cache_len = pos + 1u;
+        return 0;
+    }
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -66683,6 +67183,9 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+    if (ds4_session_is_qwen(s) && s->qwen_graph_ready) {
+        s->qwen_graph.cache_len = 0;
+    }
 #endif
 }
 
@@ -66711,4 +67214,39 @@ int ds4_session_ctx(ds4_session *s) {
 
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Model configuration registry: Qwen 3.6 27B
+ *
+ * Architecture per https://huggingface.co/Qwen/Qwen3.6-27B:
+ * 80 layers, 8192 hidden, 64 attn heads, 8 KV heads (GQA),
+ * 22016 intermediate, 32768 max seq, 152064 vocab, RoPE dim 128 / base 500000.
+ * RMSNorm + SwiGLU activation.
+ * -------------------------------------------------------------------------- */
+static const struct ds4_model_config qwen36_27b_config = {
+    .num_layers = 80,
+    .hidden_size = 8192,
+    .num_attention_heads = 64,
+    .num_key_value_heads = 8,
+    .intermediate_size = 22016,
+    .max_seq_len = 32768,
+    .vocab_size = 152064,
+    .rope_dim = 128,
+    .rope_base = 500000.0f,
+    .norm_type = DS4_NORM_RMS,
+    .mlp_activation = DS4_ACTIVATION_SWIGLU,
+    .attention_type = DS4_ATTENTION_GQA,
+    .model_name = "qwen36-27b",
+    .file_id = DS4_FILE_MAGIC_QWEN36_27B,
+    .quantization_version = 1,
+};
+
+const struct ds4_model_config *ds4_get_model_config(ds4_model_type type) {
+    switch (type) {
+        case DS4_MODEL_QWEN36_27B:
+            return &qwen36_27b_config;
+        default:
+            return NULL;
+    }
 }

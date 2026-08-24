@@ -2862,6 +2862,35 @@ int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
 
+/* Qwen standard-transformer GQA ops: store KV with n_kv_heads and run
+ * grouped-query attention mapping each query head onto its owning KV head.
+ * See metal/qwen_gqa.metal for the kernel implementations. */
+int ds4_gpu_qwen_store_kv_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *k_src,
+        const ds4_gpu_tensor *v_src,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        bool                  cache_f16);
+
+int ds4_gpu_qwen_attention_gqa_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        bool                  cache_f16);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,163 @@
+diff --git a/ds4.c b/ds4.c
+index 449140b..65da788 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -66712,3 +66712,38 @@ int ds4_session_ctx(ds4_session *s) {
+ int ds4_session_prefill_cap(ds4_session *s) {
+     return s ? (int)s->prefill_cap : 0;
+ }
++
++/* --------------------------------------------------------------------------
++ * Model configuration registry: Qwen 3.6 27B
++ *
++ * Architecture per https://huggingface.co/Qwen/Qwen3.6-27B:
++ * 80 layers, 8192 hidden, 64 attn heads, 8 KV heads (GQA),
++ * 22016 intermediate, 32768 max seq, 152064 vocab, RoPE dim 128 / base 500000.
++ * RMSNorm + SwiGLU activation.
++ * -------------------------------------------------------------------------- */
++static const struct ds4_model_config qwen36_27b_config = {
++    .num_layers = 80,
++    .hidden_size = 8192,
++    .num_attention_heads = 64,
++    .num_key_value_heads = 8,
++    .intermediate_size = 22016,
++    .max_seq_len = 32768,
++    .vocab_size = 152064,
++    .rope_dim = 128,
++    .rope_base = 500000.0f,
++    .norm_type = DS4_NORM_RMS,
++    .mlp_activation = DS4_ACTIVATION_SWIGLU,
++    .attention_type = DS4_ATTENTION_GQA,
++    .model_name = "qwen36-27b",
++    .file_id = DS4_FILE_MAGIC_QWEN36_27B,
++    .quantization_version = 1,
++};
++
++const struct ds4_model_config *ds4_get_model_config(ds4_model_type type) {
++    switch (type) {
++        case DS4_MODEL_QWEN36_27B:
++            return &qwen36_27b_config;
++        default:
++            return NULL;
++    }
++}
+diff --git a/ds4.h b/ds4.h
+index d9c7e2f..b916fc0 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -478,4 +478,57 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
+                                    uint32_t layer_start, uint32_t layer_end,
+                                    char *err, size_t errlen);
+ 
++/* --------------------------------------------------------------------------
++ * Model configuration registry.
++ *
++ * ds4_model_config is a model-agnostic description of a transformer family.
++ * It is intentionally independent from the DeepSeek/GLM-specific ds4_shape
++ * table so additional architectures (e.g. Qwen) can be registered without
++ * touching the inference core. Each registered model is selected through a
++ * ds4_model_type enumerator and exposes its on-disk file magic.
++ * -------------------------------------------------------------------------- */
++
++/* File magic used to tag model files on disk. */
++#define DS4_FILE_MAGIC_QWEN36_27B UINT32_C(0x51333627) /* "Q36'" */
++
++typedef enum {
++    DS4_NORM_LAYER,
++    DS4_NORM_RMS,
++} ds4_norm_type;
++
++typedef enum {
++    DS4_ACTIVATION_GELU,
++    DS4_ACTIVATION_SWIGLU,
++} ds4_activation;
++
++typedef enum {
++    DS4_ATTENTION_MHA,
++    DS4_ATTENTION_GQA,
++} ds4_attention_type;
++
++typedef enum {
++    DS4_MODEL_QWEN36_27B,
++    DS4_MODEL_COUNT,
++} ds4_model_type;
++
++struct ds4_model_config {
++    const char *model_name;
++    uint32_t file_id;
++    uint32_t num_layers;
++    uint32_t hidden_size;
++    uint32_t num_attention_heads;
++    uint32_t num_key_value_heads;
++    uint32_t intermediate_size;
++    uint32_t max_seq_len;
++    uint32_t vocab_size;
++    uint32_t rope_dim;
++    float rope_base;
++    ds4_norm_type norm_type;
++    ds4_activation mlp_activation;
++    ds4_attention_type attention_type;
++    uint32_t quantization_version;
++};
++
++const struct ds4_model_config *ds4_get_model_config(ds4_model_type type);
++
+ #endif
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 82b0d1a..62636c1 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -43257,3 +43257,53 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
+     (void)enabled;
+ }
++
++/* --------------------------------------------------------------------------
++ * Model-specific Metal configuration registry.
++ *
++ * ds4_metal_config groups the dispatch parameters a Metal backend tunes per a
++ * given model. configure_metal_for_model() selects sensible defaults based on
++ * the model's file magic. The Qwen 3.6 27B entry maps the model's GQA + SwiGLU
++ * + RMSNorm + RoPE requirements onto the existing Metal kernels.
++ * -------------------------------------------------------------------------- */
++struct ds4_metal_config {
++    uint32_t threads_per_threadgroup;
++    uint32_t max_threads_per_threadgroup;
++    struct { uint32_t w, h, d; } threadgroup_size; /* MTLSize */
++    bool use_flash_attention;
++    bool use_swiglu;
++    bool use_rmsnorm;
++    bool use_rope;
++    uint32_t rope_dim;
++};
++
++void configure_metal_for_model(struct ds4_metal_config *metal_config,
++                               const struct ds4_model_config *model_config) {
++    /* Start from safe defaults. */
++    metal_config->threads_per_threadgroup = 256;
++    metal_config->max_threads_per_threadgroup = 1024;
++    metal_config->threadgroup_size.w = 32;
++    metal_config->threadgroup_size.h = 8;
++    metal_config->threadgroup_size.d = 1;
++    metal_config->use_flash_attention = false;
++    metal_config->use_swiglu = false;
++    metal_config->use_rmsnorm = false;
++    metal_config->use_rope = false;
++    metal_config->rope_dim = 0;
++
++    if (!model_config) return;
++
++    /* Qwen 3.6 27B Metal configuration. */
++    if (model_config->file_id == DS4_FILE_MAGIC_QWEN36_27B) {
++        metal_config->threads_per_threadgroup = 512;
++        metal_config->max_threads_per_threadgroup = 1024;
++        metal_config->threadgroup_size.w = 32;
++        metal_config->threadgroup_size.h = 16;
++        metal_config->threadgroup_size.d = 1;
++        metal_config->use_flash_attention = true;
++        metal_config->use_swiglu = true;
++        metal_config->use_rmsnorm = true;
++        metal_config->use_rope = true;
++        metal_config->rope_dim = model_config->rope_dim;
++    }
++}
